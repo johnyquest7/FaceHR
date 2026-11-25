@@ -28,6 +28,14 @@ export interface ChromOptions {
   maxFreqHz?: number;
 }
 
+export interface OmitOptions {
+  /** Sliding window length in seconds (default 1.6 s) */
+  windowSec?: number;
+  bandpass?: boolean;
+  minFreqHz?: number;
+  maxFreqHz?: number;
+}
+
 /**
  * Extracts a blood-volume pulse (BVP) signal using the POS algorithm
  * (Wang et al., "Algorithmic Principles of Remote PPG", IEEE TBME 2017).
@@ -187,4 +195,88 @@ export function extractChromPulse(
   }
 
   return linearDetrend(s);
+}
+
+/**
+ * Extracts a blood-volume pulse (BVP) signal using illumination-normalized OMIT
+ * (Orthogonal Matrix Image Transformation, inspired by Face2PPG / Álvarez Casado & Bordallo López).
+ *
+ * Within each sliding window (~1.6 s):
+ *   1. Compute local skin-reflection unit vector s = mean([R, G, B]) / ||mean([R, G, B])||.
+ *   2. Normalize every frame by its projection onto s: C_proj(t) = C(t) / (s · C(t)) - s.
+ *      This cancels arbitrary multiplicative illumination, AE/ISO, and specular intensity
+ *      fluctuations across all skin tones without assuming a fixed chrominance model.
+ *   3. Extract the green-channel orthogonal component (strongest hemoglobin absorption)
+ *      via zero-mean overlap-add and bandpass filter.
+ */
+export function extractOmitPulse(
+  series: UniformRgbSeries,
+  options: OmitOptions = {},
+): Float64Array {
+  const { r, g, b, sampleRateHz } = series;
+  const n = r.length;
+  if (n < 4) {
+    return new Float64Array(n);
+  }
+
+  const windowSec = options.windowSec ?? 1.6;
+  const applyBandpass = options.bandpass ?? true;
+  const minFreqHz = options.minFreqHz ?? DEFAULT_MIN_FREQ_HZ;
+  const maxFreqHz = options.maxFreqHz ?? DEFAULT_MAX_FREQ_HZ;
+
+  const winLen = Math.max(4, Math.min(n, Math.round(windowSec * sampleRateHz)));
+  const out = new Float64Array(n);
+  const seg = new Float64Array(winLen);
+
+  for (let start = 0; start <= n - winLen; start++) {
+    let sumR = 0;
+    let sumG = 0;
+    let sumB = 0;
+    for (let j = 0; j < winLen; j++) {
+      const idx = start + j;
+      sumR += r[idx];
+      sumG += g[idx];
+      sumB += b[idx];
+    }
+
+    const mR = sumR / winLen;
+    const mG = sumG / winLen;
+    const mB = sumB / winLen;
+    const norm = Math.hypot(mR, mG, mB);
+    if (norm <= 1e-6) {
+      continue;
+    }
+
+    const sR = mR / norm;
+    const sG = mG / norm;
+    const sB = mB / norm;
+
+    let segSum = 0;
+    for (let j = 0; j < winLen; j++) {
+      const idx = start + j;
+      const proj = r[idx] * sR + g[idx] * sG + b[idx] * sB;
+      if (proj <= 1e-6) {
+        seg[j] = 0;
+        continue;
+      }
+      // Project onto the plane orthogonal to the user's actual skin-reflection vector s,
+      // normalized by instantaneous luminance projection `proj`.
+      const orthG = g[idx] / proj - sG;
+      const orthR = r[idx] / proj - sR;
+      const val = orthG - 0.35 * orthR;
+      seg[j] = val;
+      segSum += val;
+    }
+
+    const segMean = segSum / winLen;
+    for (let j = 0; j < winLen; j++) {
+      out[start + j] += seg[j] - segMean;
+    }
+  }
+
+  const detrended = linearDetrend(out);
+  if (!applyBandpass) {
+    return detrended;
+  }
+  return butterworthBandpassZeroPhase(detrended, sampleRateHz, minFreqHz, maxFreqHz);
 }

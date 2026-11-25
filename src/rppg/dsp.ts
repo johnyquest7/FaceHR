@@ -69,6 +69,76 @@ export function std(values: ArrayLike<number>, precomputedMean?: number): number
   return Math.sqrt(sumSq / n);
 }
 
+function medianOfArray(values: readonly number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+/**
+ * Suppresses sudden single-frame step jumps (e.g. mobile auto-exposure / white-balance steps
+ * or brief handheld taps) by MAD-clamping extreme first differences before reconstructing.
+ * Preserves smooth physiological 0.7–3.5 Hz cardiac oscillations untouched.
+ */
+export function despikeChannel(channel: Float64Array, madThreshold = 5.0): Float64Array {
+  const n = channel.length;
+  if (n < 6) {
+    return Float64Array.from(channel);
+  }
+
+  const diffs = new Float64Array(n - 1);
+  const absDiffList: number[] = new Array(n - 1);
+  for (let i = 0; i < n - 1; i++) {
+    const d = channel[i + 1] - channel[i];
+    diffs[i] = d;
+    absDiffList[i] = Math.abs(d);
+  }
+
+  const medAbsDiff = medianOfArray(absDiffList);
+  // Floor ensures clean, low-noise signals are never over-clamped
+  const robustScale = Math.max(medAbsDiff * 1.4826, 0.25);
+  const limit = Math.max(madThreshold * robustScale, 1.2);
+
+  let clampedAny = false;
+  const out = new Float64Array(n);
+  out[0] = channel[0];
+  for (let i = 0; i < n - 1; i++) {
+    let d = diffs[i];
+    if (Math.abs(d) > limit) {
+      // Extreme step jump (> 2x limit): treat as sudden AE step and zero out the jump
+      d = Math.abs(d) > limit * 2 ? 0 : Math.sign(d) * limit;
+      clampedAny = true;
+    }
+    out[i + 1] = Math.max(1, out[i] + d);
+  }
+
+  if (!clampedAny) {
+    return Float64Array.from(channel);
+  }
+
+  // Re-anchor DC mean to original median level so relative modulation depth stays accurate
+  const origMean = mean(channel);
+  const newMean = mean(out);
+  const shift = origMean - newMean;
+  for (let i = 0; i < n; i++) {
+    out[i] = Math.max(1, out[i] + shift);
+  }
+  return out;
+}
+
+/**
+ * Applies mobile AE/motion step-jump suppression across all three RGB channels.
+ */
+export function despikeRgbSeries(series: UniformRgbSeries): UniformRgbSeries {
+  return {
+    ...series,
+    r: despikeChannel(series.r),
+    g: despikeChannel(series.g),
+    b: despikeChannel(series.b),
+  };
+}
+
 /**
  * Uniformly resamples an irregular sequence of (timestampMs, r, g, b) samples
  * onto a uniform grid at `sampleRateHz` using linear interpolation.
@@ -484,6 +554,75 @@ export function computeSpectrum(
     frequencies,
     magnitudes,
     power,
+    fftSize,
+    sampleRateHz,
+    binResolutionHz,
+  };
+}
+
+/**
+ * Computes an averaged overlapping-window Welch power spectrum (50% overlap)
+ * to suppress transient handheld motion bursts in mobile rPPG signals.
+ * Falls back to a single Hann-windowed spectrum if the signal is too short to segment.
+ */
+export function computeWelchSpectrum(
+  signal: Float64Array,
+  sampleRateHz = DEFAULT_SAMPLE_RATE_HZ,
+  minFftSize = DEFAULT_FFT_SIZE,
+  segmentSec = 7.0,
+): SpectrumResult {
+  const n = signal.length;
+  const segLen = Math.round(segmentSec * sampleRateHz);
+
+  if (n < Math.round(segLen * 1.35) || segLen < 64) {
+    return computeSpectrum(applyHannWindow(linearDetrend(signal)), sampleRateHz, minFftSize);
+  }
+
+  const hop = Math.max(1, Math.floor(segLen * 0.5));
+  const fftSize = nextPowerOfTwo(Math.max(minFftSize, segLen, 2));
+  const halfBins = (fftSize >> 1) + 1;
+  const avgPower = new Float64Array(halfBins);
+  let frequencies: Float64Array | null = null;
+  let binResolutionHz = sampleRateHz / fftSize;
+  let segmentCount = 0;
+
+  for (let start = 0; start + segLen <= n; start += hop) {
+    const slice = signal.subarray(start, start + segLen);
+    const windowed = applyHannWindow(linearDetrend(slice));
+    const segSpec = computeSpectrum(windowed, sampleRateHz, fftSize);
+    if (!frequencies) {
+      frequencies = segSpec.frequencies;
+      binResolutionHz = segSpec.binResolutionHz;
+    }
+    for (let k = 0; k < halfBins; k++) {
+      avgPower[k] += segSpec.power[k];
+    }
+    segmentCount += 1;
+  }
+
+  // Always include the tail segment so the most recent heartbeats are weighted properly
+  const tailStart = n - segLen;
+  if (tailStart > 0 && tailStart % hop !== 0) {
+    const slice = signal.subarray(tailStart, n);
+    const windowed = applyHannWindow(linearDetrend(slice));
+    const segSpec = computeSpectrum(windowed, sampleRateHz, fftSize);
+    for (let k = 0; k < halfBins; k++) {
+      avgPower[k] += segSpec.power[k];
+    }
+    segmentCount += 1;
+  }
+
+  const magnitudes = new Float64Array(halfBins);
+  const invCount = segmentCount > 0 ? 1 / segmentCount : 1;
+  for (let k = 0; k < halfBins; k++) {
+    avgPower[k] *= invCount;
+    magnitudes[k] = Math.sqrt(avgPower[k]);
+  }
+
+  return {
+    frequencies: frequencies ?? new Float64Array(halfBins),
+    magnitudes,
+    power: avgPower,
     fftSize,
     sampleRateHz,
     binResolutionHz,

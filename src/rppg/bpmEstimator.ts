@@ -11,6 +11,7 @@ import {
   SpectrumResult,
   applyHannWindow,
   computeSpectrum,
+  computeWelchSpectrum,
   linearDetrend,
   parabolicInterpolatePeak,
 } from './dsp';
@@ -83,8 +84,35 @@ export function estimateSpectralBpm(
   const fftSize = options.fftSize ?? DEFAULT_FFT_SIZE;
   const priorBpm = options.priorBpm ?? null;
 
-  const windowed = applyHannWindow(linearDetrend(pulseSignal));
-  const spectrum = computeSpectrum(windowed, sampleRateHz, fftSize);
+  const detrended = linearDetrend(pulseSignal);
+  const windowed = applyHannWindow(detrended);
+  const fullSpectrum = computeSpectrum(windowed, sampleRateHz, fftSize);
+
+  // When >= 9.5 s of data is buffered, blend the high-resolution full-window FFT with an
+  // overlapping Welch periodogram (geometric weighting) to suppress transient mobile motion bursts
+  // while retaining full-window frequency sharpness.
+  let spectrum: SpectrumResult = fullSpectrum;
+  if (detrended.length >= Math.round(sampleRateHz * 9.5)) {
+    const welch = computeWelchSpectrum(detrended, sampleRateHz, fullSpectrum.fftSize, 6.5);
+    const len = fullSpectrum.magnitudes.length;
+    const blendedMag = new Float64Array(len);
+    const blendedPow = new Float64Array(len);
+    for (let i = 0; i < len; i++) {
+      const m = Math.pow(Math.max(fullSpectrum.magnitudes[i], 0), 0.65) *
+        Math.pow(Math.max(welch.magnitudes[i], 0), 0.35);
+      blendedMag[i] = m;
+      blendedPow[i] = m * m;
+    }
+    spectrum = {
+      frequencies: fullSpectrum.frequencies,
+      magnitudes: blendedMag,
+      power: blendedPow,
+      fftSize: fullSpectrum.fftSize,
+      sampleRateHz: fullSpectrum.sampleRateHz,
+      binResolutionHz: fullSpectrum.binResolutionHz,
+    };
+  }
+
   const { frequencies, magnitudes, binResolutionHz } = spectrum;
 
   const minIdx = Math.max(1, Math.ceil(minFreqHz / binResolutionHz));

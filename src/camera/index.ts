@@ -7,6 +7,7 @@ export {
 
 export {
   FaceRoiTracker,
+  computeOffscreenDimensions,
   extractSkinRgbFromImageData,
   type SkinExtractionResult,
 } from './faceRoiTracker';

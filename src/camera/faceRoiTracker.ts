@@ -10,8 +10,9 @@ import type {
 const FACE_LANDMARKER_MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 
-const OFFSCREEN_WIDTH = 320;
-const OFFSCREEN_HEIGHT = 240;
+// Aspect-preserving offscreen readback target (longest side ~360px preserves portrait mobile resolution)
+const OFFSCREEN_MAX_DIM = 360;
+const OFFSCREEN_MIN_DIM = 180;
 
 const MIN_PIXEL_VALUE = 15;
 const MAX_PIXEL_VALUE = 245;
@@ -24,6 +25,24 @@ const CR_MAX = 173;
 
 // Minimum fraction of non-clipped pixels passing strict YCbCr before falling back under tinted lighting
 const STRICT_SKIN_MIN_RATIO = 0.08;
+
+/**
+ * Computes aspect-preserving offscreen canvas dimensions so portrait mobile feeds (e.g. 480x640)
+ * are never horizontally squashed into a landscape buffer.
+ */
+export function computeOffscreenDimensions(
+  videoWidth: number,
+  videoHeight: number
+): { width: number; height: number } {
+  if (videoWidth <= 0 || videoHeight <= 0) {
+    return { width: 320, height: 240 };
+  }
+  const longest = Math.max(videoWidth, videoHeight);
+  const scale = Math.min(1, OFFSCREEN_MAX_DIM / longest);
+  const width = Math.max(OFFSCREEN_MIN_DIM, Math.round(videoWidth * scale));
+  const height = Math.max(OFFSCREEN_MIN_DIM, Math.round(videoHeight * scale));
+  return { width, height };
+}
 
 /**
  * Canonical MediaPipe 468-landmark indices for clean vascular skin ROIs.
@@ -140,7 +159,16 @@ export function extractSkinRgbFromImageData(
   let skinR = 0;
   let skinG = 0;
   let skinB = 0;
+  let skinLumSum = 0;
+  let skinLumSqSum = 0;
   let skinCount = 0;
+
+  // Store skin pixel coordinates/values for specular glare & deep shadow outlier trimming
+  const maxBoxPixels = (x1 - x0) * (y1 - y0);
+  const skinBufR = new Float32Array(maxBoxPixels);
+  const skinBufG = new Float32Array(maxBoxPixels);
+  const skinBufB = new Float32Array(maxBoxPixels);
+  const skinBufLum = new Float32Array(maxBoxPixels);
 
   let nonClippedR = 0;
   let nonClippedG = 0;
@@ -165,7 +193,8 @@ export function extractSkinRgbFromImageData(
       const b = data[idx + 2];
 
       totalCount += 1;
-      lumSum += 0.299 * r + 0.587 * g + 0.114 * b;
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+      lumSum += lum;
 
       if (
         r < MIN_PIXEL_VALUE ||
@@ -188,9 +217,15 @@ export function extractSkinRgbFromImageData(
       const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
 
       if (cb >= CB_MIN && cb <= CB_MAX && cr >= CR_MIN && cr <= CR_MAX) {
+        skinBufR[skinCount] = r;
+        skinBufG[skinCount] = g;
+        skinBufB[skinCount] = b;
+        skinBufLum[skinCount] = lum;
         skinR += r;
         skinG += g;
         skinB += b;
+        skinLumSum += lum;
+        skinLumSqSum += lum * lum;
         skinCount += 1;
       }
     }
@@ -208,10 +243,46 @@ export function extractSkinRgbFromImageData(
     return { rgb: null, brightness, saturationFraction, skinPixelRatio: 0 };
   }
 
-  // Prefer strict YCbCr skin pixels when enough are present; otherwise gracefully fall back
-  // to non-clipped pixels inside the ROI so tinted indoor lighting still yields a pulse signal.
+  // Prefer strict YCbCr skin pixels when enough are present; trim bright specular glare
+  // and dark shadow/eyebrow outliers (> 1.5 sigma from ROI skin luminance mean) to boost SNR.
   const minStrictCount = Math.max(1, Math.floor(nonClippedCount * STRICT_SKIN_MIN_RATIO));
   if (skinCount >= minStrictCount) {
+    if (skinCount >= 20) {
+      const meanSkinLum = skinLumSum / skinCount;
+      const variance = Math.max(0, skinLumSqSum / skinCount - meanSkinLum * meanSkinLum);
+      const stdSkinLum = Math.sqrt(variance);
+      if (stdSkinLum > 3.0) {
+        const lowCut = meanSkinLum - 1.5 * stdSkinLum;
+        const highCut = meanSkinLum + 1.5 * stdSkinLum;
+        let trimR = 0;
+        let trimG = 0;
+        let trimB = 0;
+        let trimCount = 0;
+        for (let i = 0; i < skinCount; i++) {
+          const l = skinBufLum[i];
+          if (l >= lowCut && l <= highCut) {
+            trimR += skinBufR[i];
+            trimG += skinBufG[i];
+            trimB += skinBufB[i];
+            trimCount += 1;
+          }
+        }
+        if (trimCount >= 12) {
+          return {
+            rgb: {
+              r: trimR / trimCount,
+              g: trimG / trimCount,
+              b: trimB / trimCount,
+              pixelCount: trimCount,
+            },
+            brightness,
+            saturationFraction,
+            skinPixelRatio,
+          };
+        }
+      }
+    }
+
     return {
       rgb: {
         r: skinR / skinCount,
@@ -359,6 +430,7 @@ export class FaceRoiTracker {
 
   private lastMpTimestampMs = -1;
   private prevGeometry: PreviousFaceGeometry | null = null;
+  private smoothedPolygons: Partial<Record<RoiBox['label'], NormalizedPoint[]>> = {};
   private prevFallbackLuma: Float32Array | null = null;
   private prevFallbackTimestampMs = -1;
 
@@ -452,19 +524,72 @@ export class FaceRoiTracker {
     }
   }
 
-  private ensureCanvas(): CanvasRenderingContext2D | null {
-    if (this.ctx) return this.ctx;
+  private ensureCanvas(videoWidth: number, videoHeight: number): CanvasRenderingContext2D | null {
     if (typeof document === 'undefined') return null;
 
-    const canvas = document.createElement('canvas');
-    canvas.width = OFFSCREEN_WIDTH;
-    canvas.height = OFFSCREEN_HEIGHT;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    if (!ctx) return null;
+    const { width, height } = computeOffscreenDimensions(videoWidth, videoHeight);
+    if (!this.canvas) {
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx) return null;
+      this.canvas = canvas;
+      this.ctx = ctx;
+      return ctx;
+    }
 
-    this.canvas = canvas;
-    this.ctx = ctx;
-    return ctx;
+    if (this.canvas.width !== width || this.canvas.height !== height) {
+      this.canvas.width = width;
+      this.canvas.height = height;
+    }
+    return this.ctx;
+  }
+
+  /**
+   * Light adaptive EMA smoothing on ROI polygon vertices to eliminate 1–2 px MediaPipe
+   * landmark jitter across eyebrows/hair edges while staying responsive to real head motion.
+   */
+  private smoothRoiBox(box: RoiBox | null, motionScore: number): RoiBox | null {
+    if (!box || !box.polygon || box.polygon.length < 3) {
+      if (box?.label) {
+        delete this.smoothedPolygons[box.label];
+      }
+      return box;
+    }
+
+    const prev = this.smoothedPolygons[box.label];
+    if (!prev || prev.length !== box.polygon.length) {
+      this.smoothedPolygons[box.label] = box.polygon.map((p) => ({ x: p.x, y: p.y }));
+      return box;
+    }
+
+    const alpha = motionScore < 0.2 ? 0.55 : motionScore < 0.5 ? 0.8 : 1.0;
+    let minX = 1;
+    let minY = 1;
+    let maxX = 0;
+    let maxY = 0;
+    const smoothed: NormalizedPoint[] = new Array(box.polygon.length);
+
+    for (let i = 0; i < box.polygon.length; i++) {
+      const x = prev[i].x + alpha * (box.polygon[i].x - prev[i].x);
+      const y = prev[i].y + alpha * (box.polygon[i].y - prev[i].y);
+      smoothed[i] = { x, y };
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    }
+
+    this.smoothedPolygons[box.label] = smoothed;
+    return {
+      ...box,
+      x: minX,
+      y: minY,
+      width: Math.max(0.015, maxX - minX),
+      height: Math.max(0.015, maxY - minY),
+      polygon: smoothed,
+    };
   }
 
   /**
@@ -489,7 +614,7 @@ export class FaceRoiTracker {
       return emptyResult(this.mode);
     }
 
-    const ctx = this.ensureCanvas();
+    const ctx = this.ensureCanvas(video.videoWidth, video.videoHeight);
     if (!ctx || !this.canvas) {
       return emptyResult(this.mode);
     }
@@ -541,9 +666,20 @@ export class FaceRoiTracker {
     }
 
     const faceBox = buildPolygonRoiBox(landmarks, FACE_OVAL_LANDMARKS, 'face', false);
-    const foreheadBox = buildPolygonRoiBox(landmarks, FOREHEAD_LANDMARKS, 'forehead', true);
-    const leftCheekBox = buildPolygonRoiBox(landmarks, LEFT_CHEEK_LANDMARKS, 'left-cheek', true);
-    const rightCheekBox = buildPolygonRoiBox(landmarks, RIGHT_CHEEK_LANDMARKS, 'right-cheek', true);
+    const motionScore = this.computeLandmarkMotion(faceBox, timestampMs);
+
+    const foreheadBox = this.smoothRoiBox(
+      buildPolygonRoiBox(landmarks, FOREHEAD_LANDMARKS, 'forehead', true),
+      motionScore
+    );
+    const leftCheekBox = this.smoothRoiBox(
+      buildPolygonRoiBox(landmarks, LEFT_CHEEK_LANDMARKS, 'left-cheek', true),
+      motionScore
+    );
+    const rightCheekBox = this.smoothRoiBox(
+      buildPolygonRoiBox(landmarks, RIGHT_CHEEK_LANDMARKS, 'right-cheek', true),
+      motionScore
+    );
 
     const roiBoxes: RoiBox[] = [];
     if (foreheadBox) roiBoxes.push(foreheadBox);
@@ -582,8 +718,6 @@ export class FaceRoiTracker {
       activeResults.length > 0
         ? activeResults.reduce((acc, r) => acc + r.saturationFraction, 0) / activeResults.length
         : 0;
-
-    const motionScore = this.computeLandmarkMotion(faceBox, timestampMs);
 
     return {
       timestampMs,
@@ -735,6 +869,7 @@ export class FaceRoiTracker {
 
   public reset(): void {
     this.prevGeometry = null;
+    this.smoothedPolygons = {};
     this.prevFallbackLuma = null;
     this.prevFallbackTimestampMs = -1;
   }

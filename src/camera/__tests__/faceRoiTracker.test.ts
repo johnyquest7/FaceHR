@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { RppgProcessor } from '../../rppg';
 import type { RoiBox } from '../../types/rppg';
-import { extractSkinRgbFromImageData } from '../faceRoiTracker';
+import { computeOffscreenDimensions, extractSkinRgbFromImageData } from '../faceRoiTracker';
 import { SyntheticPulseGenerator } from '../syntheticFeed';
 import { classifyCameraError } from '../useCamera';
 
@@ -173,6 +173,32 @@ describe('extractSkinRgbFromImageData', () => {
     expect(res.rgb!.r).toBeCloseTo(insideColor[0], 3);
     expect(res.rgb!.g).toBeCloseTo(insideColor[1], 3);
     expect(res.rgb!.b).toBeCloseTo(insideColor[2], 3);
+  });
+
+  it('trims bright specular forehead glare outliers from skin ROI averages', () => {
+    const width = 20;
+    const height = 20; // 400 pixels
+    const skin: [number, number, number] = [182, 134, 106];
+    // Bright skin-ish specular hotspot still within YCbCr & < 245, representing oily forehead glare
+    const glare: [number, number, number] = [240, 212, 190];
+
+    // 90% clean skin, 10% bright specular glare (top 2 rows)
+    const data = createRgbaBuffer(width, height, (_x, y) => (y < 2 ? glare : skin));
+
+    const res = extractSkinRgbFromImageData(data, width, height, fullBox);
+
+    expect(res.rgb).not.toBeNull();
+    // Trimmed mean should closely match true skin (134), rejecting the 212 glare pixels
+    expect(res.rgb!.g).toBeCloseTo(skin[1], 1);
+    expect(res.rgb!.pixelCount).toBe(360);
+  });
+});
+
+describe('computeOffscreenDimensions', () => {
+  it('preserves portrait mobile and landscape laptop aspect ratios cleanly', () => {
+    expect(computeOffscreenDimensions(480, 640)).toEqual({ width: 270, height: 360 });
+    expect(computeOffscreenDimensions(640, 480)).toEqual({ width: 360, height: 270 });
+    expect(computeOffscreenDimensions(720, 1280)).toEqual({ width: 203, height: 360 });
   });
 });
 

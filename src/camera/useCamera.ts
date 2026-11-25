@@ -15,11 +15,125 @@ export interface UseCameraResult {
   isStarting: boolean;
   facingMode: FacingMode;
   hasMultipleCameras: boolean;
+  isExposureLocked: boolean;
   error: CameraErrorInfo | null;
   start: (overrideFacingMode?: FacingMode) => Promise<boolean>;
   stop: () => void;
   toggleFacingMode: () => Promise<boolean>;
   clearError: () => void;
+}
+
+const AE_AWB_SETTLE_DELAY_MS = 1500;
+
+interface ExtendedTrackCapabilities extends MediaTrackCapabilities {
+  exposureMode?: string[];
+  exposureTime?: { min?: number; max?: number };
+  iso?: { min?: number; max?: number };
+  whiteBalanceMode?: string[];
+  colorTemperature?: { min?: number; max?: number };
+  focusMode?: string[];
+  focusDistance?: { min?: number; max?: number };
+}
+
+interface ExtendedTrackSettings extends MediaTrackSettings {
+  exposureMode?: string;
+  exposureTime?: number;
+  iso?: number;
+  whiteBalanceMode?: string;
+  colorTemperature?: number;
+  focusMode?: string;
+  focusDistance?: number;
+}
+
+function clampToCapability(
+  value: number | undefined,
+  range: { min?: number; max?: number } | undefined
+): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  let v = value;
+  if (range?.min !== undefined && v < range.min) v = range.min;
+  if (range?.max !== undefined && v > range.max) v = range.max;
+  return v;
+}
+
+/**
+ * Attempts to lock camera Auto-Exposure (AE), Auto-White-Balance (AWB), and Auto-Focus
+ * to their settled values via WebRTC MediaTrackConstraints.
+ * Prevents smartphones from dynamically shifting exposure/gain mid-scan, which otherwise
+ * injects 0.5–1.5 Hz artifacts into the facial rPPG band.
+ * Gracefully no-ops on browsers (such as iOS Safari) that do not expose manual track locks.
+ */
+async function tryLockCameraAutoControls(stream: MediaStream): Promise<boolean> {
+  const videoTrack = stream.getVideoTracks()[0];
+  if (!videoTrack || videoTrack.readyState !== 'live') return false;
+  if (
+    typeof videoTrack.getCapabilities !== 'function' ||
+    typeof videoTrack.applyConstraints !== 'function'
+  ) {
+    return false;
+  }
+
+  let caps: ExtendedTrackCapabilities;
+  let settings: ExtendedTrackSettings;
+  try {
+    caps = videoTrack.getCapabilities() as ExtendedTrackCapabilities;
+    settings =
+      typeof videoTrack.getSettings === 'function'
+        ? (videoTrack.getSettings() as ExtendedTrackSettings)
+        : {};
+  } catch {
+    return false;
+  }
+
+  const aeConstraint: Record<string, unknown> = {};
+  if (Array.isArray(caps.exposureMode) && caps.exposureMode.includes('manual')) {
+    aeConstraint.exposureMode = 'manual';
+    const expTime = clampToCapability(settings.exposureTime, caps.exposureTime);
+    if (expTime !== undefined) aeConstraint.exposureTime = expTime;
+    const iso = clampToCapability(settings.iso, caps.iso);
+    if (iso !== undefined) aeConstraint.iso = iso;
+  }
+
+  const awbConstraint: Record<string, unknown> = {};
+  if (Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.includes('manual')) {
+    awbConstraint.whiteBalanceMode = 'manual';
+    const temp = clampToCapability(settings.colorTemperature, caps.colorTemperature);
+    if (temp !== undefined) awbConstraint.colorTemperature = temp;
+  }
+
+  const focusConstraint: Record<string, unknown> = {};
+  if (Array.isArray(caps.focusMode) && caps.focusMode.includes('manual')) {
+    focusConstraint.focusMode = 'manual';
+    const dist = clampToCapability(settings.focusDistance, caps.focusDistance);
+    if (dist !== undefined) focusConstraint.focusDistance = dist;
+  }
+
+  const combined = { ...aeConstraint, ...awbConstraint, ...focusConstraint };
+  if (Object.keys(combined).length === 0) {
+    return false;
+  }
+
+  try {
+    await videoTrack.applyConstraints({
+      advanced: [combined as MediaTrackConstraintSet],
+    });
+    return Object.keys(aeConstraint).length > 0 || Object.keys(awbConstraint).length > 0;
+  } catch {
+    // Some Android drivers reject combined AE+AWB+AF locks; fall back to locking individually
+    let lockedAny = false;
+    for (const part of [aeConstraint, awbConstraint]) {
+      if (Object.keys(part).length === 0) continue;
+      try {
+        await videoTrack.applyConstraints({
+          advanced: [part as MediaTrackConstraintSet],
+        });
+        lockedAny = true;
+      } catch {
+        // Ignore unsupported per-driver constraint
+      }
+    }
+    return lockedAny;
+  }
 }
 
 /**
@@ -132,13 +246,13 @@ function stopMediaStream(stream: MediaStream | null): void {
 async function requestStreamWithFallback(facingMode: FacingMode): Promise<MediaStream> {
   const mediaDevices = navigator.mediaDevices;
 
-  // Primary mobile-safe 640x480 @ ~30fps constraints
+  // Primary mobile-safe 640x480 @ 30fps constraints (prefer >= 20fps so phones avoid 15fps binning)
   const primaryConstraints: MediaStreamConstraints = {
     video: {
       facingMode: { ideal: facingMode },
       width: { ideal: 640 },
       height: { ideal: 480 },
-      frameRate: { ideal: 30, min: 15 },
+      frameRate: { ideal: 30, min: 20 },
     },
     audio: false,
   };
@@ -155,14 +269,26 @@ async function requestStreamWithFallback(facingMode: FacingMode): Promise<MediaS
     // Relax frameRate/resolution constraints on older cameras or virtual webcams
     try {
       return await mediaDevices.getUserMedia({
-        video: { facingMode },
+        video: {
+          facingMode: { ideal: facingMode },
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          frameRate: { ideal: 30, min: 15 },
+        },
         audio: false,
       });
     } catch {
-      return await mediaDevices.getUserMedia({
-        video: true,
-        audio: false,
-      });
+      try {
+        return await mediaDevices.getUserMedia({
+          video: { facingMode },
+          audio: false,
+        });
+      } catch {
+        return await mediaDevices.getUserMedia({
+          video: true,
+          audio: false,
+        });
+      }
     }
   }
 }
@@ -172,10 +298,12 @@ export function useCamera(videoRef: RefObject<HTMLVideoElement | null>): UseCame
   const [isStarting, setIsStarting] = useState(false);
   const [facingMode, setFacingMode] = useState<FacingMode>('user');
   const [hasMultipleCameras, setHasMultipleCameras] = useState(false);
+  const [isExposureLocked, setIsExposureLocked] = useState(false);
   const [error, setError] = useState<CameraErrorInfo | null>(null);
 
   const streamRef = useRef<MediaStream | null>(null);
   const wakeLockRef = useRef<WakeLockSentinelLike | null>(null);
+  const aeLockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const facingModeRef = useRef<FacingMode>('user');
   const isActiveRef = useRef(false);
   const startRequestIdRef = useRef(0);
@@ -232,7 +360,15 @@ export function useCamera(videoRef: RefObject<HTMLVideoElement | null>): UseCame
     }
   }, []);
 
+  const clearAeLockTimer = useCallback(() => {
+    if (aeLockTimerRef.current !== null) {
+      clearTimeout(aeLockTimerRef.current);
+      aeLockTimerRef.current = null;
+    }
+  }, []);
+
   const teardownStream = useCallback(() => {
+    clearAeLockTimer();
     stopMediaStream(streamRef.current);
     streamRef.current = null;
 
@@ -245,7 +381,7 @@ export function useCamera(videoRef: RefObject<HTMLVideoElement | null>): UseCame
       }
       video.srcObject = null;
     }
-  }, [videoRef]);
+  }, [clearAeLockTimer, videoRef]);
 
   const stop = useCallback(() => {
     startRequestIdRef.current += 1;
@@ -255,6 +391,7 @@ export function useCamera(videoRef: RefObject<HTMLVideoElement | null>): UseCame
     if (!unmountedRef.current) {
       setIsActive(false);
       setIsStarting(false);
+      setIsExposureLocked(false);
     }
   }, [releaseWakeLock, teardownStream]);
 
@@ -339,8 +476,33 @@ export function useCamera(videoRef: RefObject<HTMLVideoElement | null>): UseCame
         if (!unmountedRef.current) {
           setIsActive(true);
           setIsStarting(false);
+          setIsExposureLocked(false);
           setError(null);
         }
+
+        // Allow mobile AE/AWB ~1.5s to converge on the user's face, then lock manual exposure/WB
+        // when supported so sensor auto-gain stops corrupting the 0.7–3.5 Hz pulse band.
+        const lockedStream = stream;
+        clearAeLockTimer();
+        aeLockTimerRef.current = setTimeout(() => {
+          aeLockTimerRef.current = null;
+          if (
+            unmountedRef.current ||
+            startRequestIdRef.current !== requestId ||
+            streamRef.current !== lockedStream
+          ) {
+            return;
+          }
+          void tryLockCameraAutoControls(lockedStream).then((locked) => {
+            if (
+              !unmountedRef.current &&
+              startRequestIdRef.current === requestId &&
+              streamRef.current === lockedStream
+            ) {
+              setIsExposureLocked(locked);
+            }
+          });
+        }, AE_AWB_SETTLE_DELAY_MS);
 
         void acquireWakeLock();
         void refreshVideoDevices();
@@ -357,7 +519,7 @@ export function useCamera(videoRef: RefObject<HTMLVideoElement | null>): UseCame
         return false;
       }
     },
-    [acquireWakeLock, refreshVideoDevices, stop, teardownStream, videoRef]
+    [acquireWakeLock, clearAeLockTimer, refreshVideoDevices, stop, teardownStream, videoRef]
   );
 
   const toggleFacingMode = useCallback(async (): Promise<boolean> => {
@@ -428,6 +590,7 @@ export function useCamera(videoRef: RefObject<HTMLVideoElement | null>): UseCame
     isStarting,
     facingMode,
     hasMultipleCameras,
+    isExposureLocked,
     error,
     start,
     stop,

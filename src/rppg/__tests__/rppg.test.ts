@@ -8,9 +8,11 @@ import {
   butterworthBandpassZeroPhase,
   computeSpectrum,
   createIdleEstimate,
+  despikeRgbSeries,
   designButterworthHighpass2,
   designButterworthLowpass2,
   estimateSpectralBpm,
+  extractOmitPulse,
   extractPosPulse,
   getBiquadPoleRadius,
   linearDetrend,
@@ -453,5 +455,152 @@ describe('RppgProcessor end-to-end estimation', () => {
     expect(est.quality).toBe('poor');
     expect(est.diagnostics.lightingScore).toBeLessThan(25);
     expect(est.guidance.toLowerCase()).toMatch(/dark|bright|light/);
+  });
+
+  it('recovers accurate BPM with OMIT across light and dark skin tones under specular motion', () => {
+    const targetBpm = 78;
+    const f0 = targetBpm / 60;
+    const fs = 30;
+    const n = fs * 12;
+
+    const skinProfiles = [
+      { label: 'dark', baseR: 95, baseG: 68, baseB: 52 },
+      { label: 'light', baseR: 215, baseG: 175, baseB: 150 },
+    ];
+
+    for (const profile of skinProfiles) {
+      const r = new Float64Array(n);
+      const g = new Float64Array(n);
+      const b = new Float64Array(n);
+      for (let i = 0; i < n; i++) {
+        const t = i / fs;
+        const pulse = Math.sin(2 * Math.PI * f0 * t);
+        // Strong 8% multiplicative specular/AE oscillation at 1.95 Hz (117 BPM)
+        const specular = 1 + 0.08 * Math.sin(2 * Math.PI * 1.95 * t + 0.5);
+        r[i] = profile.baseR * (1 + 0.0025 * pulse) * specular;
+        g[i] = profile.baseG * (1 + 0.011 * pulse) * specular;
+        b[i] = profile.baseB * (1 + 0.0055 * pulse) * specular;
+      }
+
+      const omitPulse = extractOmitPulse({
+        sampleRateHz: fs,
+        r,
+        g,
+        b,
+        durationSec: (n - 1) / fs,
+        startTimestampMs: 0,
+      });
+      const est = estimateSpectralBpm(omitPulse, fs);
+      expect(est.bpm).not.toBeNull();
+      expect(Math.abs((est.bpm ?? 0) - targetBpm)).toBeLessThanOrEqual(2.0);
+    }
+  });
+
+  it('suppresses sudden mobile auto-exposure step jumps via despikeRgbSeries', () => {
+    const targetBpm = 74;
+    const baseFrames = generateSyntheticExtractions({
+      bpm: targetBpm,
+      durationSec: 13,
+      fps: 30,
+      seed: 2026,
+    });
+
+    // Inject abrupt smartphone AE steps (+14 at 4 s, -12 at 8.5 s)
+    const steppedFrames = baseFrames.map((f) => {
+      const elapsedSec = (f.timestampMs - 1000) / 1000;
+      const aeOffset = elapsedSec >= 8.5 ? 2 : elapsedSec >= 4.0 ? 14 : 0;
+      const shiftRgb = (rgb: RgbSample): RgbSample => ({
+        ...rgb,
+        r: rgb.r + aeOffset,
+        g: rgb.g + aeOffset,
+        b: rgb.b + aeOffset,
+      });
+      return {
+        ...f,
+        fusedRgb: f.fusedRgb ? shiftRgb(f.fusedRgb) : null,
+        regions: {
+          forehead: f.regions.forehead ? shiftRgb(f.regions.forehead) : undefined,
+          leftCheek: f.regions.leftCheek ? shiftRgb(f.regions.leftCheek) : undefined,
+          rightCheek: f.regions.rightCheek ? shiftRgb(f.regions.rightCheek) : undefined,
+        },
+      };
+    });
+
+    // Verify despikeRgbSeries removes the step jump cleanly
+    const uniform = resampleRgbBuffer(
+      steppedFrames.map((f) => ({
+        timestampMs: f.timestampMs,
+        r: f.fusedRgb!.r,
+        g: f.fusedRgb!.g,
+        b: f.fusedRgb!.b,
+      })),
+      30,
+    );
+    const despiked = despikeRgbSeries(uniform);
+    const maxStep = Math.max(
+      ...Array.from({ length: despiked.g.length - 1 }, (_, i) =>
+        Math.abs(despiked.g[i + 1] - despiked.g[i]),
+      ),
+    );
+    expect(maxStep).toBeLessThan(3.0);
+
+    // End-to-end processor should still lock accurately onto 74 BPM
+    const processor = new RppgProcessor();
+    let latest = createIdleEstimate();
+    for (const frame of steppedFrames) {
+      latest = processor.pushSample(frame);
+    }
+    expect(latest.status).toBe('measuring');
+    expect(latest.bpm).not.toBeNull();
+    expect(Math.abs((latest.bpm ?? 0) - targetBpm)).toBeLessThanOrEqual(2.5);
+  });
+
+  it('down-weights noisy/occluded cheeks via Multi-ROI SNR fusion to preserve clean forehead BPM', () => {
+    const targetBpm = 66;
+    const rng = createRng(808);
+    const cleanFrames = generateSyntheticExtractions({
+      bpm: targetBpm,
+      durationSec: 13,
+      fps: 30,
+      seed: 809,
+    });
+
+    // Corrupt leftCheek and rightCheek with strong broadband + 124 BPM artifact (beard/shadow/glasses)
+    // while keeping forehead clean at 66 BPM.
+    const occludedFrames = cleanFrames.map((f) => {
+      const tSec = (f.timestampMs - 1000) / 1000;
+      const noiseCheek = (orig: RgbSample): RgbSample => {
+        const artifact = 12 * Math.sin(2 * Math.PI * (124 / 60) * tSec);
+        return {
+          r: Math.max(5, orig.r + artifact + 6 * gaussianNoise(rng)),
+          g: Math.max(5, orig.g - artifact * 0.8 + 6 * gaussianNoise(rng)),
+          b: Math.max(5, orig.b + artifact * 0.5 + 6 * gaussianNoise(rng)),
+          pixelCount: orig.pixelCount,
+        };
+      };
+      const forehead = f.regions.forehead!;
+      const leftCheek = noiseCheek(f.regions.leftCheek!);
+      const rightCheek = noiseCheek(f.regions.rightCheek!);
+      return {
+        ...f,
+        regions: { forehead, leftCheek, rightCheek },
+        fusedRgb: {
+          r: 0.4 * forehead.r + 0.3 * leftCheek.r + 0.3 * rightCheek.r,
+          g: 0.4 * forehead.g + 0.3 * leftCheek.g + 0.3 * rightCheek.g,
+          b: 0.4 * forehead.b + 0.3 * leftCheek.b + 0.3 * rightCheek.b,
+          pixelCount: forehead.pixelCount + leftCheek.pixelCount + rightCheek.pixelCount,
+        },
+      };
+    });
+
+    const processor = new RppgProcessor();
+    let latest = createIdleEstimate();
+    for (const frame of occludedFrames) {
+      latest = processor.pushSample(frame);
+    }
+
+    expect(latest.status).toBe('measuring');
+    expect(latest.bpm).not.toBeNull();
+    expect(Math.abs((latest.bpm ?? 0) - targetBpm)).toBeLessThanOrEqual(2.5);
   });
 });

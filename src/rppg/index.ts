@@ -11,6 +11,9 @@ export {
   biquadFrequencyResponseMagnitude,
   butterworthBandpassZeroPhase,
   computeSpectrum,
+  computeWelchSpectrum,
+  despikeChannel,
+  despikeRgbSeries,
   designButterworthHighpass2,
   designButterworthLowpass2,
   fftRadix2,
@@ -31,8 +34,10 @@ export {
 
 export {
   extractChromPulse,
+  extractOmitPulse,
   extractPosPulse,
   type ChromOptions,
+  type OmitOptions,
   type PosOptions,
 } from './algorithms';
 

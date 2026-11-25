@@ -150,13 +150,46 @@ export function useHeartRateMonitor(
     };
 
     if (video && typeof video.requestVideoFrameCallback === 'function') {
-      const onVideoFrame = (now: number) => {
+      let lastPresentedFrames = -1;
+      let mediaTimeAnchorOffsetMs: number | null = null;
+      let lastHardwareTsMs = -1;
+
+      const onVideoFrame = (now: number, metadata: VideoFrameCallbackMetadata) => {
         if (unmountedRef.current || loopSessionIdRef.current !== sessionId) return;
 
-        const ts = Number.isFinite(now) && now > 0 ? now : nowMs();
-        if (ts - lastProcessedMsRef.current >= RVFC_CAMERA_MIN_INTERVAL_MS) {
-          lastProcessedMsRef.current = ts;
-          processCurrentVideoFrame(ts);
+        // Deduplicate repeated callback frames on 60/120 Hz mobile displays
+        const presented = metadata?.presentedFrames;
+        const isNewDecodedFrame =
+          typeof presented !== 'number' || presented !== lastPresentedFrames;
+
+        const fallbackNow = Number.isFinite(now) && now > 0 ? now : nowMs();
+        let frameTs = fallbackNow;
+
+        // Prefer hardware-aligned mediaTime / captureTime to eliminate main-thread JS jitter
+        if (typeof metadata?.captureTime === 'number' && Number.isFinite(metadata.captureTime) && metadata.captureTime > 0) {
+          frameTs = metadata.captureTime;
+        } else if (typeof metadata?.mediaTime === 'number' && Number.isFinite(metadata.mediaTime) && metadata.mediaTime > 0) {
+          const mediaMs = metadata.mediaTime * 1000;
+          if (mediaTimeAnchorOffsetMs === null) {
+            mediaTimeAnchorOffsetMs = fallbackNow - mediaMs;
+          }
+          const candidateTs = mediaTimeAnchorOffsetMs + mediaMs;
+          // Re-anchor if drift exceeds 500 ms (e.g., stream pause/resume on mobile)
+          if (Math.abs(candidateTs - fallbackNow) > 500) {
+            mediaTimeAnchorOffsetMs = fallbackNow - mediaMs;
+            frameTs = fallbackNow;
+          } else {
+            frameTs = candidateTs;
+          }
+        }
+
+        if (isNewDecodedFrame && frameTs > lastHardwareTsMs && frameTs - lastProcessedMsRef.current >= RVFC_CAMERA_MIN_INTERVAL_MS) {
+          if (typeof presented === 'number') {
+            lastPresentedFrames = presented;
+          }
+          lastHardwareTsMs = frameTs;
+          lastProcessedMsRef.current = frameTs;
+          processCurrentVideoFrame(frameTs);
         }
 
         const currentVideo = videoRef.current;

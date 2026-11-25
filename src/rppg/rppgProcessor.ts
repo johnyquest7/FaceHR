@@ -11,7 +11,7 @@ import type {
   HeartRateEstimate,
   RgbSample,
 } from '../types/rppg';
-import { extractChromPulse, extractPosPulse } from './algorithms';
+import { extractChromPulse, extractOmitPulse, extractPosPulse } from './algorithms';
 import { BpmTemporalTracker, estimateSpectralBpm } from './bpmEstimator';
 import {
   DEFAULT_FFT_SIZE,
@@ -19,6 +19,9 @@ import {
   DEFAULT_MIN_FREQ_HZ,
   DEFAULT_SAMPLE_RATE_HZ,
   TimedRgbSample,
+  UniformRgbSeries,
+  despikeRgbSeries,
+  linearDetrend,
   mean,
   resampleRgbBuffer,
   std,
@@ -185,16 +188,55 @@ function buildNormalizedWaveform(pulse: Float64Array, targetLength: number): num
   return out;
 }
 
+type RegionKey = 'forehead' | 'leftCheek' | 'rightCheek';
+const REGION_KEYS: readonly RegionKey[] = ['forehead', 'leftCheek', 'rightCheek'];
+
+interface RoiPulseCandidate {
+  key: RegionKey;
+  series: UniformRgbSeries;
+  pulse: Float64Array;
+  bpm: number | null;
+  snrDb: number;
+  /** Physiological plausibility score (penalizes non-physiological >3.5% AC/DC motion/glare) */
+  plausibility: number;
+  effectiveScore: number;
+  weight: number;
+}
+
+/**
+ * Standardizes a pulse trace to zero-mean, unit-std so multi-ROI waveforms
+ * can be combined purely by SNR weight without scale bias.
+ */
+function zNormalizePulse(pulse: Float64Array): Float64Array {
+  const n = pulse.length;
+  const out = new Float64Array(n);
+  if (n === 0) return out;
+  const m = mean(pulse);
+  const s = std(pulse, m);
+  if (s <= 1e-9) return out;
+  const inv = 1 / s;
+  for (let i = 0; i < n; i++) {
+    out[i] = (pulse[i] - m) * inv;
+  }
+  return out;
+}
+
 export class RppgProcessor {
   private readonly options: RppgProcessorOptions;
   private readonly tracker: BpmTemporalTracker;
 
   private samples: TimedRgbSample[] = [];
+  private regionSamples: Record<RegionKey, TimedRgbSample[]> = {
+    forehead: [],
+    leftCheek: [],
+    rightCheek: [],
+  };
   private frameTimestamps: number[] = [];
   private lastSampleTimestampMs: number | null = null;
   private lastAnalysisTimestampMs: number | null = null;
   private noFaceSinceMs: number | null = null;
   private wasWarmedUp = false;
+  private pendingInitialBpm: number | null = null;
 
   // Smoothed acquisition telemetry
   private motionEma: number | null = null;
@@ -204,6 +246,7 @@ export class RppgProcessor {
   // Cached spectral analysis outputs between throttled FFT cycles
   private lastRawPosBpm: number | null = null;
   private lastRawChromBpm: number | null = null;
+  private lastConsensusRefBpm: number | null = null;
   private lastSnrDb = -15;
   private lastWaveform: number[] = [];
 
@@ -217,16 +260,19 @@ export class RppgProcessor {
 
   public reset(): void {
     this.samples = [];
+    this.regionSamples = { forehead: [], leftCheek: [], rightCheek: [] };
     this.frameTimestamps = [];
     this.lastSampleTimestampMs = null;
     this.lastAnalysisTimestampMs = null;
     this.noFaceSinceMs = null;
     this.wasWarmedUp = false;
+    this.pendingInitialBpm = null;
     this.motionEma = null;
     this.brightnessEma = null;
     this.saturationEma = null;
     this.lastRawPosBpm = null;
     this.lastRawChromBpm = null;
+    this.lastConsensusRefBpm = null;
     this.lastSnrDb = -15;
     this.lastWaveform = [];
     this.tracker.reset();
@@ -239,10 +285,13 @@ export class RppgProcessor {
 
   private clearSignalBuffer(): void {
     this.samples = [];
+    this.regionSamples = { forehead: [], leftCheek: [], rightCheek: [] };
     this.lastAnalysisTimestampMs = null;
     this.wasWarmedUp = false;
+    this.pendingInitialBpm = null;
     this.lastRawPosBpm = null;
     this.lastRawChromBpm = null;
+    this.lastConsensusRefBpm = null;
     this.lastSnrDb = -15;
     this.lastWaveform = [];
     this.tracker.reset();
@@ -358,12 +407,29 @@ export class RppgProcessor {
       g: rgb.g,
       b: rgb.b,
     });
+    for (const key of REGION_KEYS) {
+      const regionRgb = sample.regions[key];
+      if (isValidRgb(regionRgb)) {
+        this.regionSamples[key].push({
+          timestampMs,
+          r: regionRgb.r,
+          g: regionRgb.g,
+          b: regionRgb.b,
+        });
+      }
+    }
     this.lastSampleTimestampMs = timestampMs;
 
-    // Trim buffer to sliding window (~14 seconds).
+    // Trim global and per-ROI buffers to sliding window (~14 seconds).
     const minWindowMs = timestampMs - this.options.windowSec * 1000;
     while (this.samples.length > 2 && this.samples[0].timestampMs < minWindowMs) {
       this.samples.shift();
+    }
+    for (const key of REGION_KEYS) {
+      const buf = this.regionSamples[key];
+      while (buf.length > 2 && buf[0].timestampMs < minWindowMs) {
+        buf.shift();
+      }
     }
 
     const telemetry = this.updateTelemetryEma(sample);
@@ -390,7 +456,7 @@ export class RppgProcessor {
       windowSec: this.options.windowSec,
       snrDb: isWarmedUp ? this.lastSnrDb : -15,
       posBpm: isWarmedUp ? this.lastRawPosBpm : null,
-      chromBpm: isWarmedUp ? this.lastRawChromBpm : null,
+      chromBpm: isWarmedUp ? (this.lastConsensusRefBpm ?? this.lastRawChromBpm) : null,
       motionScore: telemetry.motionScore,
       brightness: telemetry.brightness,
       saturationFraction: telemetry.saturationFraction,
@@ -436,6 +502,176 @@ export class RppgProcessor {
     return Math.max(0, spanMs / 1000);
   }
 
+  /**
+   * Runs independent POS extraction per anatomical ROI (forehead, left cheek, right cheek)
+   * and fuses their pulses via dynamic SNR-squared weighting so shadowed, glared, or occluded
+   * regions are automatically down-weighted. Also returns an SNR-weighted RGB series for
+   * CHROM and OMIT consensus estimation.
+   */
+  private extractMultiRoiSignals(
+    fallbackUniform: UniformRgbSeries,
+    priorBpm: number | null,
+    isWarmedUp: boolean,
+  ): { posPulse: Float64Array; weightedRgb: UniformRgbSeries } {
+    if (!isWarmedUp) {
+      const posPulse = extractPosPulse(fallbackUniform, {
+        windowSec: 1.6,
+        bandpass: true,
+        minFreqHz: this.options.minFreqHz,
+        maxFreqHz: this.options.maxFreqHz,
+      });
+      return { posPulse, weightedRgb: fallbackUniform };
+    }
+
+    const candidates: RoiPulseCandidate[] = [];
+    const targetLen = fallbackUniform.r.length;
+    const minCoverageSec = fallbackUniform.durationSec * 0.78;
+
+    for (const key of REGION_KEYS) {
+      const rawBuf = this.regionSamples[key];
+      if (rawBuf.length < 30) continue;
+      const spanSec = (rawBuf[rawBuf.length - 1].timestampMs - rawBuf[0].timestampMs) / 1000;
+      if (spanSec < minCoverageSec) continue;
+
+      const resampled = despikeRgbSeries(resampleRgbBuffer(rawBuf, this.options.sampleRateHz));
+      if (resampled.r.length < Math.floor(targetLen * 0.78)) continue;
+
+      const pulse = extractPosPulse(resampled, {
+        windowSec: 1.6,
+        bandpass: true,
+        minFreqHz: this.options.minFreqHz,
+        maxFreqHz: this.options.maxFreqHz,
+      });
+
+      const specEst = estimateSpectralBpm(pulse, resampled.sampleRateHz, {
+        minFreqHz: this.options.minFreqHz,
+        maxFreqHz: this.options.maxFreqHz,
+        fftSize: this.options.fftSize,
+        priorBpm,
+      });
+      const snrDb = computeSpectralSnrDb(
+        specEst.spectrum,
+        specEst.frequencyHz,
+        this.options.minFreqHz,
+        this.options.maxFreqHz,
+      );
+
+      // Estimate normalized green-channel AC/DC ratio; physiological facial BVP is ~0.2%–2.5%.
+      // Much larger fluctuations indicate motion, glare, or occlusion artifacts rather than pulse.
+      const gMean = Math.max(1, mean(resampled.g));
+      const gAcDc = std(linearDetrend(resampled.g)) / gMean;
+      const plausibility =
+        gAcDc <= 0.035 ? 1.0 : Math.max(0.05, Math.exp(-((gAcDc - 0.035) / 0.025)));
+
+      // Effective ROI quality score combines spectral SNR (dB) with physiological amplitude sanity
+      const effectiveScore = snrDb - (1 - plausibility) * 14.0;
+
+      candidates.push({
+        key,
+        series: resampled,
+        pulse,
+        bpm: specEst.bpm,
+        snrDb,
+        plausibility,
+        effectiveScore,
+        weight: 0,
+      });
+    }
+
+    if (candidates.length === 0) {
+      const posPulse = extractPosPulse(fallbackUniform, {
+        windowSec: 1.6,
+        bandpass: true,
+        minFreqHz: this.options.minFreqHz,
+        maxFreqHz: this.options.maxFreqHz,
+      });
+      return { posPulse, weightedRgb: fallbackUniform };
+    }
+
+    // Sort strongest effective quality score first so we can phase-align and exclude corrupted ROIs
+    candidates.sort((a, b) => b.effectiveScore - a.effectiveScore);
+    const best = candidates[0];
+
+    let weightSum = 0;
+    for (const c of candidates) {
+      const scoreGap = best.effectiveScore - c.effectiveScore;
+      const bpmDisagrees =
+        best.bpm !== null && c.bpm !== null && Math.abs(best.bpm - c.bpm) > 10.0;
+
+      // Hard-exclude corrupted ROIs (shadow, glare, beard, cheek motion) so large raw
+      // artifacts cannot leak into the fused RGB trace used by CHROM/OMIT.
+      if (
+        (best.effectiveScore >= 1.0 && scoreGap > 4.5) ||
+        (best.effectiveScore >= 1.0 && bpmDisagrees && scoreGap > 2.0) ||
+        (best.plausibility >= 0.8 && c.plausibility < 0.35)
+      ) {
+        c.weight = 0;
+      } else {
+        c.weight = Math.exp(-scoreGap * 0.45) * c.plausibility * REGION_WEIGHTS[c.key];
+      }
+      weightSum += c.weight;
+    }
+
+    if (weightSum <= 1e-9) {
+      best.weight = 1;
+      weightSum = 1;
+    }
+
+    const activeCandidates = candidates.filter((c) => c.weight > 0);
+
+    // Align all active ROI series on their overlapping tail length
+    let commonLen = activeCandidates[0].pulse.length;
+    for (let i = 1; i < activeCandidates.length; i++) {
+      if (activeCandidates[i].pulse.length < commonLen) {
+        commonLen = activeCandidates[i].pulse.length;
+      }
+    }
+
+    const refTail = zNormalizePulse(
+      activeCandidates[0].pulse.subarray(activeCandidates[0].pulse.length - commonLen),
+    );
+    const fusedPulse = new Float64Array(commonLen);
+    const fusedR = new Float64Array(commonLen);
+    const fusedG = new Float64Array(commonLen);
+    const fusedB = new Float64Array(commonLen);
+
+    for (const c of activeCandidates) {
+      const w = c.weight / weightSum;
+      const pTail = zNormalizePulse(c.pulse.subarray(c.pulse.length - commonLen));
+
+      // Ensure polarity alignment with the highest-SNR ROI before summing
+      let dot = 0;
+      for (let i = 0; i < commonLen; i++) {
+        dot += refTail[i] * pTail[i];
+      }
+      const sign = dot >= 0 ? 1 : -1;
+
+      const rOffset = c.series.r.length - commonLen;
+      for (let i = 0; i < commonLen; i++) {
+        fusedPulse[i] += sign * w * pTail[i];
+        fusedR[i] += w * c.series.r[rOffset + i];
+        fusedG[i] += w * c.series.g[rOffset + i];
+        fusedB[i] += w * c.series.b[rOffset + i];
+      }
+    }
+
+    const weightedRgb: UniformRgbSeries = {
+      sampleRateHz: this.options.sampleRateHz,
+      r: fusedR,
+      g: fusedG,
+      b: fusedB,
+      durationSec: (commonLen - 1) / this.options.sampleRateHz,
+      startTimestampMs:
+        fallbackUniform.startTimestampMs +
+        Math.max(0, (fallbackUniform.r.length - commonLen) / this.options.sampleRateHz) * 1000,
+    };
+
+    return {
+      posPulse: linearDetrend(fusedPulse),
+      weightedRgb,
+    };
+  }
+
   private runSpectralAnalysis(
     timestampMs: number,
     isWarmedUp: boolean,
@@ -443,17 +679,14 @@ export class RppgProcessor {
     fps: number,
     bufferDurationSec: number,
   ): void {
-    const uniform = resampleRgbBuffer(this.samples, this.options.sampleRateHz);
-    if (uniform.r.length < 30) {
+    const rawUniform = resampleRgbBuffer(this.samples, this.options.sampleRateHz);
+    if (rawUniform.r.length < 30) {
       return;
     }
 
-    const posPulse = extractPosPulse(uniform, {
-      windowSec: 1.6,
-      bandpass: true,
-      minFreqHz: this.options.minFreqHz,
-      maxFreqHz: this.options.maxFreqHz,
-    });
+    const uniform = despikeRgbSeries(rawUniform);
+    const priorBpm = this.tracker.getCurrentBpm();
+    const { posPulse, weightedRgb } = this.extractMultiRoiSignals(uniform, priorBpm, isWarmedUp);
 
     // Expose live filtered pulse waveform (~120 points, -1..1) once >= 2s buffered.
     this.lastWaveform = buildNormalizedWaveform(posPulse, this.options.waveformLength);
@@ -462,20 +695,30 @@ export class RppgProcessor {
       return;
     }
 
-    const chromPulse = extractChromPulse(uniform, {
+    const chromPulse = extractChromPulse(weightedRgb, {
+      minFreqHz: this.options.minFreqHz,
+      maxFreqHz: this.options.maxFreqHz,
+    });
+    const omitPulse = extractOmitPulse(weightedRgb, {
+      windowSec: 1.6,
+      bandpass: true,
       minFreqHz: this.options.minFreqHz,
       maxFreqHz: this.options.maxFreqHz,
     });
 
-    const priorBpm = this.tracker.getCurrentBpm();
-    const posEst = estimateSpectralBpm(posPulse, uniform.sampleRateHz, {
+    const posEst = estimateSpectralBpm(posPulse, weightedRgb.sampleRateHz, {
       minFreqHz: this.options.minFreqHz,
       maxFreqHz: this.options.maxFreqHz,
       fftSize: this.options.fftSize,
       priorBpm,
     });
-
-    const chromEst = estimateSpectralBpm(chromPulse, uniform.sampleRateHz, {
+    const chromEst = estimateSpectralBpm(chromPulse, weightedRgb.sampleRateHz, {
+      minFreqHz: this.options.minFreqHz,
+      maxFreqHz: this.options.maxFreqHz,
+      fftSize: this.options.fftSize,
+      priorBpm,
+    });
+    const omitEst = estimateSpectralBpm(omitPulse, weightedRgb.sampleRateHz, {
       minFreqHz: this.options.minFreqHz,
       maxFreqHz: this.options.maxFreqHz,
       fftSize: this.options.fftSize,
@@ -494,29 +737,85 @@ export class RppgProcessor {
       this.options.minFreqHz,
       this.options.maxFreqHz,
     );
+    const omitSnrDb = computeSpectralSnrDb(
+      omitEst.spectrum,
+      omitEst.frequencyHz,
+      this.options.minFreqHz,
+      this.options.maxFreqHz,
+    );
 
     this.lastRawPosBpm = posEst.bpm;
     this.lastRawChromBpm = chromEst.bpm;
 
-    // Prefer POS as primary (best robustness to lighting drift + motion);
-    // blend slightly with CHROM when both agree tightly, or fall back to CHROM if POS is missing.
-    let candidateBpm = posEst.bpm;
-    let primarySnrDb = posSnrDb;
-
-    if (posEst.bpm !== null && chromEst.bpm !== null) {
-      const diff = Math.abs(posEst.bpm - chromEst.bpm);
-      if (diff <= 4.0) {
-        candidateBpm = 0.7 * posEst.bpm + 0.3 * chromEst.bpm;
-        primarySnrDb = Math.max(posSnrDb, (posSnrDb + chromSnrDb) / 2);
-      } else if (chromSnrDb > posSnrDb + 4.0 && posSnrDb < 1.5) {
-        candidateBpm = chromEst.bpm;
-        primarySnrDb = chromSnrDb;
-      }
-    } else if (posEst.bpm === null && chromEst.bpm !== null) {
-      candidateBpm = chromEst.bpm;
-      primarySnrDb = chromSnrDb;
+    // 3-Algorithm Consensus Fusion (Multi-ROI POS + OMIT + CHROM):
+    // Combine agreeing estimators weighted by SNR; if only 2 of 3 agree (e.g., CHROM
+    // degrades under tinted indoor mobile LED lighting while POS & OMIT lock tightly),
+    // trust the agreeing pair cleanly.
+    const algos: Array<{ name: 'pos' | 'omit' | 'chrom'; bpm: number; snrDb: number; baseWeight: number }> = [];
+    if (posEst.bpm !== null) {
+      algos.push({ name: 'pos', bpm: posEst.bpm, snrDb: posSnrDb, baseWeight: 1.25 });
+    }
+    if (omitEst.bpm !== null) {
+      algos.push({ name: 'omit', bpm: omitEst.bpm, snrDb: omitSnrDb, baseWeight: 1.15 });
+    }
+    if (chromEst.bpm !== null) {
+      algos.push({ name: 'chrom', bpm: chromEst.bpm, snrDb: chromSnrDb, baseWeight: 0.9 });
     }
 
+    let candidateBpm: number | null = posEst.bpm;
+    let primarySnrDb = posSnrDb;
+    let consensusRefBpm: number | null = chromEst.bpm;
+
+    if (algos.length >= 2) {
+      // Find the largest agreeing cluster (within 4.5 BPM) with highest total SNR score
+      let bestCluster: typeof algos = [];
+      let bestClusterScore = -Infinity;
+
+      for (const anchor of algos) {
+        const cluster = algos.filter((a) => Math.abs(a.bpm - anchor.bpm) <= 4.5);
+        const clusterScore =
+          cluster.length * 10 +
+          cluster.reduce((sum, a) => sum + Math.max(-5, a.snrDb) * a.baseWeight, 0);
+        if (clusterScore > bestClusterScore) {
+          bestClusterScore = clusterScore;
+          bestCluster = cluster;
+        }
+      }
+
+      if (bestCluster.length >= 2) {
+        let wSum = 0;
+        let bpmSum = 0;
+        let snrSum = 0;
+        let maxClusterSnr = -15;
+        for (const a of bestCluster) {
+          const w = a.baseWeight * Math.max(0.25, a.snrDb + 4.0);
+          wSum += w;
+          bpmSum += w * a.bpm;
+          snrSum += w * a.snrDb;
+          if (a.snrDb > maxClusterSnr) maxClusterSnr = a.snrDb;
+        }
+        candidateBpm = bpmSum / wSum;
+        primarySnrDb = Math.max(maxClusterSnr, snrSum / wSum);
+
+        // Pick the closest secondary algorithm to POS (or cluster mean) for agreement reporting
+        const refCandidate = bestCluster.find((a) => a.name !== 'pos') ?? bestCluster[0];
+        consensusRefBpm = refCandidate.bpm;
+      } else {
+        // No pair agrees within 4.5 BPM: pick the highest-SNR algorithm (preferring POS on ties)
+        const best = [...algos].sort(
+          (a, b) => (b.snrDb + (b.name === 'pos' ? 1.0 : 0)) - (a.snrDb + (a.name === 'pos' ? 1.0 : 0)),
+        )[0];
+        candidateBpm = best.bpm;
+        primarySnrDb = best.snrDb;
+        consensusRefBpm = chromEst.bpm ?? omitEst.bpm;
+      }
+    } else if (algos.length === 1) {
+      candidateBpm = algos[0].bpm;
+      primarySnrDb = algos[0].snrDb;
+      consensusRefBpm = null;
+    }
+
+    this.lastConsensusRefBpm = consensusRefBpm;
     this.lastSnrDb = primarySnrDb;
 
     // Pre-assess confidence for adaptive tracker weighting.
@@ -526,8 +825,8 @@ export class RppgProcessor {
       warmUpSec: this.options.warmUpSec,
       windowSec: this.options.windowSec,
       snrDb: primarySnrDb,
-      posBpm: posEst.bpm,
-      chromBpm: chromEst.bpm,
+      posBpm: this.lastRawPosBpm,
+      chromBpm: consensusRefBpm,
       motionScore: telemetry.motionScore,
       brightness: telemetry.brightness,
       saturationFraction: telemetry.saturationFraction,
@@ -540,6 +839,23 @@ export class RppgProcessor {
       preliminaryQuality.diagnostics.motionStability >= 25 &&
       preliminaryQuality.diagnostics.lightingScore >= 25
     ) {
+      // Smart initial lock: avoid seeding the very first reading on a noisy sub-0 dB transient;
+      // either require SNR >= 0 dB or two consecutive agreeing candidates within 6 BPM.
+      if (this.tracker.getCurrentBpm() === null && primarySnrDb < 0) {
+        if (
+          this.pendingInitialBpm !== null &&
+          Math.abs(candidateBpm - this.pendingInitialBpm) <= 6.0
+        ) {
+          const seeded = 0.5 * (candidateBpm + this.pendingInitialBpm);
+          this.pendingInitialBpm = null;
+          this.tracker.update(seeded, timestampMs, primarySnrDb, preliminaryQuality.confidence);
+        } else {
+          this.pendingInitialBpm = candidateBpm;
+        }
+        return;
+      }
+
+      this.pendingInitialBpm = null;
       this.tracker.update(
         candidateBpm,
         timestampMs,
