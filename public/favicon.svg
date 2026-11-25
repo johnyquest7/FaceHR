@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <radialGradient id="bgGlow" cx="50%" cy="38%" r="65%">
+      <stop offset="0%" stop-color="#1e1b2e" />
+      <stop offset="55%" stop-color="#0f1524" />
+      <stop offset="100%" stop-color="#090d16" />
+    </radialGradient>
+    <radialGradient id="pulseHalo" cx="50%" cy="50%" r="48%">
+      <stop offset="0%" stop-color="#f43f5e" stop-opacity="0.32" />
+      <stop offset="65%" stop-color="#f43f5e" stop-opacity="0.08" />
+      <stop offset="100%" stop-color="#f43f5e" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="heartGrad" x1="20%" y1="15%" x2="80%" y2="85%">
+      <stop offset="0%" stop-color="#fda4af" />
+      <stop offset="45%" stop-color="#fb7185" />
+      <stop offset="100%" stop-color="#e11d48" />
+    </linearGradient>
+    <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fb7185" stop-opacity="0.55" />
+      <stop offset="50%" stop-color="#38bdf8" stop-opacity="0.22" />
+      <stop offset="100%" stop-color="#f43f5e" stop-opacity="0.45" />
+    </linearGradient>
+  </defs>
+
+  <!-- Maskable-safe obsidian canvas -->
+  <rect width="512" height="512" rx="112" fill="url(#bgGlow)" />
+  <circle cx="256" cy="256" r="210" fill="url(#pulseHalo)" />
+
+  <!-- Subtle camera lens alignment ring -->
+  <circle cx="256" cy="256" r="184" stroke="url(#ringGrad)" stroke-width="5" stroke-dasharray="28 16" stroke-linecap="round" opacity="0.85" />
+
+  <!-- Stylized heart silhouette -->
+  <path
+    d="M256 382C256 382 118 294 118 198C118 148 156 112 202 112C229 112 248 126 256 144C264 126 283 112 310 112C356 112 394 148 394 198C394 294 256 382 256 382Z"
+    fill="url(#heartGrad)"
+  />
+
+  <!-- Crisp clinical ECG pulse line across heart -->
+  <path
+    d="M112 248H184L208 214L236 292L268 176L294 268L314 248H400"
+    stroke="#090d16"
+    stroke-width="26"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    opacity="0.5"
+  />
+  <path
+    d="M112 248H184L208 214L236 292L268 176L294 268L314 248H400"
+    stroke="#ffffff"
+    stroke-width="16"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>
