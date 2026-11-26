@@ -1,5 +1,15 @@
 # PulseCam — On-Device Camera Heart Rate Monitor
 
+<p align="center">
+  <a href="https://johnyquest7.github.io/FaceHR/">
+    <img src="docs/pulsecam-banner.jpg" alt="PulseCam — 100% On-Device Camera Heart Rate Monitor" width="100%" />
+  </a>
+</p>
+
+<p align="center">
+  <strong><a href="https://johnyquest7.github.io/FaceHR/">Try the Live HTTPS App on Phone or Laptop →</a></strong>
+</p>
+
 **PulseCam** is a 100% on-device Progressive Web App (PWA) that estimates heart rate (BPM) in real time using your laptop or smartphone camera via **facial remote photoplethysmography (rPPG)**.
 
 No video frames, facial landmarks, or biometric signals ever leave your device.
@@ -10,17 +20,18 @@ No video frames, facial landmarks, or biometric signals ever leave your device.
 
 Every heartbeat causes subtle, microscopic changes in blood volume beneath facial skin, slightly altering how light is absorbed and reflected (strongest in the green channel, weakest in red). PulseCam extracts this pulse signal entirely in your browser:
 
-1. **Facial ROI Tracking (`@mediapipe/tasks-vision`)**:
-   - Uses **MediaPipe Face Landmarker** (WebAssembly runtime bundled locally in `public/mediapipe/wasm/`) to isolate high-perfusion facial regions: **forehead**, **left cheek**, and **right cheek**, avoiding eyes, mouth, and background clutter.
-   - Automatically falls back to skin-color segmentation if WebAssembly/GPU tracking is unavailable.
-2. **Dual rPPG Extraction (POS + CHROM)**:
-   - **POS** (*Plane-Orthogonal-to-Skin*, Wang et al., IEEE TBME 2017) — projects normalized RGB signals onto a plane orthogonal to specular reflection to reject illumination drift and small head motions.
-   - **CHROM** (*Chrominance-based rPPG*, De Haan & Jeanne, IEEE TBME 2013) — computes chrominance combinations to cross-validate the extracted pulse wave.
+1. **Mobile-Optimized Camera & Facial ROI Tracking (`@mediapipe/tasks-vision`)**:
+   - Locks smartphone **Auto-Exposure (AE)**, **Auto-White-Balance (AWB)**, and focus after a brief `1.5 s` stabilization period when supported, and uses hardware frame timestamps (`requestVideoFrameCallback`) with 60/120 Hz deduplication.
+   - Uses **MediaPipe Face Landmarker** (WebAssembly runtime packaged locally into `public/mediapipe/wasm/`) with aspect-preserving portrait/landscape buffers, adaptive landmark smoothing, and `±1.5 σ` specular glare/shadow outlier trimming across the **forehead**, **left cheek**, and **right cheek**.
+   - Automatically falls back to YCbCr skin-color segmentation if WebAssembly/GPU tracking is unavailable.
+2. **Multi-ROI SNR Fusion & 3-Algorithm Consensus (POS + OMIT + CHROM)**:
+   - Runs **POS** (*Plane-Orthogonal-to-Skin*, Wang et al., IEEE TBME 2017) independently on forehead, left cheek, and right cheek, automatically excluding shadowed, glared, or occluded regions via SNR and physiological AC/DC plausibility weighting.
+   - Cross-validates with illumination-normalized **OMIT** (*Orthogonal Matrix Image Transformation*) and **CHROM** (*Chrominance-based rPPG*, De Haan & Jeanne, IEEE TBME 2013) using SNR-weighted consensus clustering.
 3. **Signal Processing & Quality Scoring**:
-   - Uniform 30 Hz resampling to handle mobile frame-rate jitter.
+   - Uniform 30 Hz resampling and MAD-based step-jump despiking to handle mobile frame-rate jitter and abrupt exposure steps.
    - Linear detrending, Hann windowing, and zero-phase Butterworth bandpass filtering (**0.70–3.50 Hz**, corresponding to **42–210 BPM**).
-   - Zero-padded FFT with parabolic peak interpolation, harmonic/subharmonic disambiguation, and temporal outlier rejection.
-   - Live confidence score (0–100%) combining spectral SNR, POS/CHROM agreement, motion stability, lighting quality, and effective FPS.
+   - Welch-assisted 4096-point FFT with parabolic peak interpolation, harmonic/subharmonic disambiguation, and physiological temporal tracking.
+   - Live confidence score (0–100%) and color-coded face alignment outline (**solid green** = locked good/excellent signal).
 4. **Demo Pulse Mode**:
    - Includes a built-in synthetic rPPG signal generator so you can verify the live DSP pipeline and UI even without a camera.
 
